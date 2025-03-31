@@ -1,88 +1,93 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const http = require('http');
 const { Server } = require('socket.io');
-const mongoose = require('mongoose');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+const io = new Server(server);
 
-// 連接MongoDB
 mongoose.connect('mongodb+srv://hoyin:Lowis19790919@lowislau919.hudf8.mongodb.net/poker?retryWrites=true&w=majority')
   .then(() => console.log('MongoDB已連接'))
-  .catch(err => console.error('MongoDB連接失敗:', err));
+  .catch(err => console.log(err));
 
-// 玩家模型
-const PlayerSchema = new mongoose.Schema({ username: String, chips: Number });
-const Player = mongoose.model('Player', PlayerSchema);
+const rooms = {};
 
-// 撲克牌邏輯
-const suits = ['♠', '♣', '♦', '♥'];
-const ranks = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A'];
-const deck = suits.flatMap(suit => ranks.map(rank => rank + suit));
+// 檢查牌局是否結束（只剩一個玩家未棄牌）
+const checkGameEnd = (room, roomId) => {
+  const activePlayers = room.players.filter(player => !player.folded);
+  if (activePlayers.length === 1) {
+    // 只剩一個玩家未棄牌，該玩家贏得底池
+    const winner = activePlayers[0];
+    winner.chips += room.pot;
+    io.to(roomId).emit('gameUpdate', { ...room, message: `${winner.username} 贏得底池 ${room.pot} 籌碼！` });
 
-function shuffleDeck() {
-  const shuffled = [...deck];
-  for (let i = shuffled.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    // 延遲 3 秒後開始新牌局
+    setTimeout(() => {
+      startNewGame(roomId);
+    }, 3000);
   }
-  return shuffled;
-}
+};
 
-// 房間管理
-const rooms = new Map();
+// 開始新牌局
+const startNewGame = (roomId) => {
+  const room = rooms[roomId];
+  if (room) {
+    const deck = ['A♠', 'K♠', 'Q♠', 'J♠', '10♠', '9♠', '8♠', '7♠', '6♠', '5♠', '4♠', '3♠', '2♠',
+                  'A♥', 'K♥', 'Q♥', 'J♥', '10♥', '9♥', '8♥', '7♥', '6♥', '5♥', '4♥', '3♥', '2♥',
+                  'A♣', 'K♣', 'Q♣', 'J♣', '10♣', '9♣', '8♣', '7♣', '6♣', '5♣', '4♣', '3♣', '2♣',
+                  'A♦', 'K♦', 'Q♦', 'J♦', '10♦', '9♦', '8♦', '7♦', '6♦', '5♦', '4♦', '3♦', '2♦'];
+    deck.sort(() => Math.random() - 0.5);
+    room.players.forEach(player => {
+      player.hand = [deck.pop(), deck.pop()];
+      player.folded = false;
+    });
+    room.communityCards = [];
+    room.pot = 0;
+    room.currentPlayer = 0;
+    io.to(roomId).emit('roomUpdate', room);
+  }
+};
 
 io.on('connection', (socket) => {
-  console.log('玩家連接:', socket.id);
-
-  socket.on('joinRoom', async ({ roomId, username }) => {
+  socket.on('joinRoom', ({ roomId, username }) => {
+    if (!rooms[roomId]) {
+      rooms[roomId] = {
+        players: [],
+        communityCards: [],
+        pot: 0,
+        currentPlayer: 0
+      };
+    }
+    rooms[roomId].players.push({ id: socket.id, username, chips: 1000, hand: [], folded: false });
     socket.join(roomId);
-    let player = await Player.findOne({ username });
-    if (!player) {
-      player = new Player({ username, chips: 1000 });
-      await player.save();
-    }
-
-    if (!rooms.has(roomId)) {
-      rooms.set(roomId, { players: [], deck: shuffleDeck(), communityCards: [], pot: 0, currentPlayer: 0 });
-    }
-    const room = rooms.get(roomId);
-    room.players.push({ id: socket.id, username, hand: room.deck.splice(0, 2), chips: player.chips });
-    io.to(roomId).emit('roomUpdate', room);
+    io.to(roomId).emit('roomUpdate', rooms[roomId]);
   });
 
   socket.on('startGame', (roomId) => {
-    const room = rooms.get(roomId);
-    room.communityCards = room.deck.splice(0, 5);
-    io.to(roomId).emit('gameUpdate', room);
+    startNewGame(roomId);
   });
 
-  socket.on('bet', async ({ roomId, amount }) => {
-    const room = rooms.get(roomId);
-    const player = room.players.find(p => p.id === socket.id);
-    if (player.chips >= amount) {
+  socket.on('bet', ({ roomId, amount }) => {
+    const room = rooms[roomId];
+    if (room && room.players[room.currentPlayer].id === socket.id) {
+      const player = room.players[room.currentPlayer];
       player.chips -= amount;
       room.pot += amount;
       room.currentPlayer = (room.currentPlayer + 1) % room.players.length;
-      await Player.updateOne({ username: player.username }, { chips: player.chips });
       io.to(roomId).emit('gameUpdate', room);
+      checkGameEnd(room, roomId); // 檢查牌局是否結束
     }
   });
 
   socket.on('fold', (roomId) => {
-    const room = rooms.get(roomId);
-    room.players = room.players.filter(p => p.id !== socket.id);
-    room.currentPlayer = room.currentPlayer % room.players.length;
-    io.to(roomId).emit('gameUpdate', room);
-  });
-
-  socket.on('disconnect', () => {
-    rooms.forEach((room, roomId) => {
-      room.players = room.players.filter(p => p.id !== socket.id);
-      if (room.players.length === 0) rooms.delete(roomId);
-      else io.to(roomId).emit('roomUpdate', room);
-    });
+    const room = rooms[roomId];
+    if (room && room.players[room.currentPlayer].id === socket.id) {
+      room.players[room.currentPlayer].folded = true;
+      room.currentPlayer = (room.currentPlayer + 1) % room.players.length;
+      io.to(roomId).emit('gameUpdate', room);
+      checkGameEnd(room, roomId); // 檢查牌局是否結束
+    }
   });
 });
 
